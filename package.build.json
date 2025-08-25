@@ -1,0 +1,7 @@
+{
+  "name": "serverjet",
+  "version": "0.0.1",
+  "main": "index.js",
+  "repository": "https://github.com/outofthegrid-st/serverjet.git",
+  "license": "AGPL-3.0-only"
+}
