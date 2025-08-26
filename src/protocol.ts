@@ -1,8 +1,6 @@
 import {
   BinaryReader,
   BinaryWriter,
-  type BufferLike,
-  chunkToBuffer,
   concatBuffers,
   deserialize,
   getDefaultMask,
@@ -10,17 +8,15 @@ import {
   maskBuffer,
   RuntimeError,
   serialize,
+  timingSafeEqual,
 } from "std-crate";
 
-import {
-  type BinaryToTextEncoding,
-  type HttpHeaders,
-  IterableWithKey,
-} from "./_types";
+import type { Redis } from "ioredis";
 
-import { __assertType, Bin } from "./util";
-import { Z_AGID_IDENTITY } from "./z";
-import { __aesGcm2E, __hkdfSha256, __hmacSha256 } from "./core";
+import { __chunkToBuffer } from "./core";
+import { __assertType, Bin, Enc } from "./util";
+import { __aesGcm2E, __aesGcm2D, __hkdfSha256, __hmacSha256 } from "./crypto";
+import type { BinaryToTextEncoding, BufferLike, HttpHeaders, MaybePromise } from "./_types";
 
 
 type Entry = [string | number | symbol, unknown];
@@ -34,14 +30,17 @@ interface NSER {
 
 
 const magic_ = Uint8Array.from([
-  // 
+  0X53, 0X45, 0X52, 0X56,
+  0X45, 0X52, 0X4A, 0X45,
+  0X54, 0X30, 0X45, 0X4E,
+  0X56, 0X50, 0X4B, 0X54,
 ]);
 
 
 export const JET_V1 = "t/v1 (0.jet.alpha)";
 
 
-export class JetPayload implements IterableWithKey<Entry[0], Entry[1]> {
+export class JetPayload {
   public static object<T extends Record<string | number | symbol, unknown>>(o: T): JetPayload {
     return new JetPayload(Object.entries(o));
   }
@@ -235,20 +234,6 @@ export class JetPayload implements IterableWithKey<Entry[0], Entry[1]> {
 }
 
 
-export interface ProtocolInit {
-  versionId?: string | number;
-  secureTransportKey?: BufferLike;
-  maskByte?: number | Uint8Array;
-  compressionAlgorithm?: number;
-  supportIncomingCompression?: number[];
-  transportKey: Uint8Array | null;
-
-  /**
-   * ATTENTION!! When true, protocol's did NOT sign or check integrity of packets
-   */
-  bypassSignature?: boolean;
-}
-
 class JetProtocol {
   public static toBytes(src: unknown): Uint8Array {
     if(!(src instanceof JetPayload)) {
@@ -268,7 +253,7 @@ class JetProtocol {
   }
 
   public static toPayload(bin: BufferLike): JetPayload {
-    const r = new BinaryReader(chunkToBuffer(bin));
+    const r = new BinaryReader(__chunkToBuffer(bin));
     const e = deserialize<readonly Entry[]>(r);
 
     if(!Array.isArray(e)) {
@@ -277,42 +262,71 @@ class JetProtocol {
 
     return new JetPayload(e);
   }
+}
 
+
+export interface EnvelopeInit {
+  versionId?: string | number;
+  secureTransportKey?: BufferLike;
+  maskByte?: number | Uint8Array;
+  compressionAlgorithm?: number;
+  supportIncomingCompression?: number[];
+  allowedWindow?: number;
+  redisClient?: Redis;
+  redisStoragePrefix?: string;
+  queryUnixTimestamp?: () => MaybePromise<number>;
+
+  /**
+   * ATTENTION!! When true, protocol's did NOT sign or check integrity of packets
+   */
+  bypassSignature?: boolean;
+}
+
+export class JetEnvelope {
   readonly #Protected_: {
     version: string | number;
-    compressionAlgorithm: number;
+    // compressionAlgorithm: number;
     maskByte: number | Uint8Array;
     transportKey: Uint8Array | null;
-    supportIncomingCompression: ReadonlySet<number>;
-    noSign?: boolean;
-    currentTimestamp: number | null;
+    // supportIncomingCompression: ReadonlySet<number>;
+    noSign: boolean | null;
+    allowedWindow: number;
+    redisClient: Redis | null;
+    seenNonces: Map<string, number>;
+    storagePrefix: string;
+    disposed: boolean;
+    currentTimestamp: (() => MaybePromise<number>) | null;
   };
 
-  public constructor(o?: ProtocolInit) {
-    const supportIncomingCompression = [ o?.compressionAlgorithm ?? Z_AGID_IDENTITY ];
-
-    if(o?.supportIncomingCompression && Array.isArray(o.supportIncomingCompression)) {
-      supportIncomingCompression.push(...o.supportIncomingCompression);
-    }
-
-    const transportKey = o?.secureTransportKey ? chunkToBuffer(o.secureTransportKey) : null;
+  public constructor(o?: EnvelopeInit) {
+    const transportKey = o?.secureTransportKey ? __chunkToBuffer(o.secureTransportKey) : null;
 
     if(transportKey != null && transportKey.length < 0x40) {
       throw new RuntimeError("[JetProtocol] transport key is too short to ensure a secure transport. Use keys with size >= 64 bytes");
     }
+
+    let allowedWindow = o?.allowedWindow ?? 0x3C;
+
+    if(allowedWindow < 0x01) {
+      allowedWindow = 0x3C;
+    }
     
     this.#Protected_ = {
       transportKey,
-      noSign: o?.bypassSignature,
+      allowedWindow,
+      disposed: false,
+      seenNonces: new Map(),
+      currentTimestamp: null,
+      redisClient: o?.redisClient ?? null,
+      noSign: o?.bypassSignature ?? null,
       version: o?.versionId ?? JET_V1,
       maskByte: o?.maskByte ?? getDefaultMask(),
-      currentTimestamp: Math.floor(Date.now() / 1000),
-      compressionAlgorithm: o?.compressionAlgorithm ?? Z_AGID_IDENTITY,
-      supportIncomingCompression: new Set(supportIncomingCompression),
+      storagePrefix: o?.redisStoragePrefix || `tsj_${o?.versionId ?? JET_V1}.sns__`,
     };
   }
 
   public get version(): string | number {
+    this.#EnsureNotDisposed();
     return this.#Protected_.version;
   }
 
@@ -322,6 +336,7 @@ class JetProtocol {
     payload: unknown,
     enc?: BinaryToTextEncoding // eslint-disable-line comma-dangle
   ): Promise<Uint8Array | string> {
+    this.#EnsureNotDisposed();
     const ww = new BinaryWriter();
 
     serialize(ww, magic_);
@@ -346,31 +361,105 @@ class JetProtocol {
     }
 
     const bytes = ww.drain();
+
+    // TODO: handle compression
+
     if(!enc) return bytes;
-    // TODO: encoding !!
+    return new Enc(enc).encode(bytes);
   }
 
-  public async unwrapIncomingPacket<T = unknown>(
-    pkt: BufferLike,
+  public async unwrapIncomingPacket(
+    packet: BufferLike,
     inputEncoding?: BinaryToTextEncoding // eslint-disable-line comma-dangle
-  ): Promise<T> {
-    // TODO: unwrap packet
+  ): Promise<JetPayload> {
+    this.#EnsureNotDisposed();
+
+    if(
+      typeof packet === "string" &&
+      !!inputEncoding &&
+      Enc.isBinaryToTextEncoding(inputEncoding)
+    ) {
+      packet = new Enc(inputEncoding).decode(packet);
+    }
+    
+    const reader = new BinaryReader(__chunkToBuffer(packet));
+   
+    // TODO: handle decompression
+
+    const mag = deserialize<Uint8Array>(reader);
+
+    /** PACKET VERSION */
+    deserialize<string | number>(reader);
+    /** PACKET VERSION */
+
+    const encFlag = deserialize<number>(reader);
+    const signFlag = deserialize<number>(reader);
+
+    if(!timingSafeEqual(mag, magic_)) {
+      throw new RuntimeError("[JetEnvelope] the provided packet does not appear to be a transport envelope", "ERR_INVALID_ARGUMENT");
+    }
+
+    if(encFlag === 1) {
+      if(!this.#Protected_.transportKey) {
+        throw new RuntimeError("[JetEnvelope] failed to unwrap incoming packet: no transport key configured");
+      }
+
+      const header = deserialize<Uint8Array>(reader);
+      const cipT = maskBuffer(deserialize<Uint8Array>(reader), this.#Protected_.maskByte);
+      const mac = maskBuffer(deserialize<Uint8Array>(reader), this.#Protected_.maskByte);
+      const nonce = maskBuffer(deserialize<Uint8Array>(reader), this.#Protected_.maskByte);
+
+      const now = await this.#CheckTimestampWindow(header);
+      await this.#CheckNonceReplay(nonce, now);
+
+      const dmk = await __hkdfSha256(this.#Protected_.transportKey);
+      const ek = dmk.subarray(0, 0x20);
+      const sk = dmk.subarray(0x20, 0x40);
+
+      if(signFlag === 1) {
+        const macF = await __hmacSha256(sk, concatBuffers(header, nonce, cipT));
+        const mac16 = macF.subarray(0, 0x10);
+
+        if(!timingSafeEqual(mac16, mac)) {
+          throw new RuntimeError("[JetEnvelope] failed to check integrity of incoming packet", "ERR_INVALID_SIGNATURE");
+        }
+      }
+
+      const plain = await __aesGcm2D(ek, cipT, nonce, header);
+      return JetProtocol.toPayload(plain);
+    }
+
+    const bytes = maskBuffer(deserialize<Uint8Array>(reader), this.#Protected_.maskByte);
+    return JetProtocol.toPayload(bytes);
   }
 
-  public outgoingHeaders(): HttpHeaders {
+  public headers(): HttpHeaders {
     return {
       "X-Jet-Version": String(this.#Protected_.version).trim(),
-      "X-Jet-Compression-Flag": this.#Protected_.compressionAlgorithm.toString(),
-      // TODO: the rest of necessary headers
+      "X-Jet-Compression-Flag": "-0x00",
+      "X-Jet-Transfer-Encoding": "<enc>",
     };
   }
 
+  public dispose(): void {
+    if(!this.#Protected_.disposed) {
+      this.#Protected_.disposed = true;
+
+      this.#Protected_.seenNonces.clear();
+      this.#Protected_.transportKey = null;
+      this.#Protected_.redisClient = null;
+      this.#Protected_.maskByte = null!;
+    }
+  }
+
   async #Encrypt(src: BufferLike, kv: number = 1, hkdfInfo?: Uint8Array): Promise<NSER | null> {
+    this.#EnsureNotDisposed();
+
     if(!this.#Protected_.transportKey)
       return null;
 
     const nonce = await Bin.randomBytes(0xC);
-    const ts = this.#Protected_.currentTimestamp ?? Math.floor(Date.now() / 1000);
+    const ts = await this.#GetTimestamp();
 
     const dmk = await __hkdfSha256(this.#Protected_.transportKey, hkdfInfo);
     const header = new Uint8Array(0x06);
@@ -398,6 +487,72 @@ class JetProtocol {
       nonce,
       mac: macF.subarray(0, 0x10),
     };
+  }
+
+  async #CheckNonceReplay(nonce: Uint8Array, now: number): Promise<void> {
+    this.#EnsureNotDisposed();
+    const key = Enc.encodeHex(nonce);
+
+    if(this.#Protected_.redisClient != null) {
+      const exists = await this.#Protected_.redisClient.exists(key);
+
+      if(exists) {
+        throw new RuntimeError("[JetEnvelope] packet nonce refused due to replay attack protection");
+      }
+
+      await this.#Protected_.redisClient.set(
+        key, "1",
+        "EX", this.#Protected_.allowedWindow * 2,
+        "NX" // eslint-disable-line comma-dangle
+      );
+    } else {
+      for(const [n, t] of this.#Protected_.seenNonces.entries()) {
+        if(now - t > this.#Protected_.allowedWindow * 2) {
+          this.#Protected_.seenNonces.delete(n);
+        }
+      }
+
+      if(this.#Protected_.seenNonces.has(key)) {
+        throw new RuntimeError("[JetEnvelope] packet nonce refused due to replay attack protection");
+      }
+
+      this.#Protected_.seenNonces.set(key, now);
+    }
+  }
+
+  async #CheckTimestampWindow(header: Uint8Array): Promise<number> {
+    this.#EnsureNotDisposed();
+    const view = new DataView(header.buffer, header.byteOffset, header.byteLength);
+    
+    const ts = view.getUint32(1, false);
+    const now = await this.#GetTimestamp();
+
+    if(Math.abs(now - ts) > this.#Protected_.allowedWindow) {
+      throw new RuntimeError(`[JetEnvelope] packet window was expired t-${Math.abs(now - ts)}`);
+    }
+
+    return now;
+  }
+
+  async #GetTimestamp(): Promise<number> {
+    this.#EnsureNotDisposed();
+
+    if(typeof this.#Protected_.currentTimestamp === "function") {
+      const ts = await this.#Protected_.currentTimestamp();
+
+      if(typeof ts !== "number" || Number.isNaN(ts))
+        return Math.floor(Date.now() / 0x3E8);
+
+      return ts;
+    }
+
+    return Math.floor(Date.now() / 0x3E8);
+  }
+
+  #EnsureNotDisposed(): void {
+    if(this.#Protected_.disposed) {
+      throw new RuntimeError("[JetEnvelope] this instance is already disposed", "ERR_RESOURCE_DISPOSED");
+    }
   }
 }
 

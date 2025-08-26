@@ -1,12 +1,13 @@
 export * from "./_types";
+export * from "./core";
+export * from "./crypto";
 
 export {
-  default as JetProtocol,
-  type ProtocolInit,
-  JetPayload,
+  type EnvelopeInit,
   JET_V1,
+  JetEnvelope,
+  JetPayload,
+  default as JetProtocol,
 } from "./protocol";
 
-export * from "./time";
 export * from "./util";
-export * from "./z";

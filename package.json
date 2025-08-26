@@ -36,6 +36,7 @@
     "typescript": "^5.4.5"
   },
   "dependencies": {
+    "@types/ioredis": "^5.0.0",
     "std-crate": "^0.1.2"
   }
 }
